@@ -1,36 +1,28 @@
 import express from 'express';
+import { createClient } from '@supabase/supabase-js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const DATA_DIR = join(__dirname, 'data');
-const DATA_FILE = join(DATA_DIR, 'board-data.json');
+const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SECRET_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false }
+  })
+  : null;
 
 const MAX_TITLE_CHARS = 200;
 const MAX_SUMMARY_CHARS = 280;
 const MAX_CONTENT_CHARS = 2000;
 const MAX_COMMENT_CHARS = 1000;
 
-function ensureDataFile() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+function requireDatabase(res) {
+  if (!supabase) {
+    res.status(503).json({ error: 'Database is not configured. Set SUPABASE_URL and SUPABASE_SECRET_KEY.' });
+    return null;
   }
 
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ boards: [], comments: [] }, null, 2), 'utf8');
-  }
-}
-
-function readStore() {
-  ensureDataFile();
-  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-}
-
-function writeStore(store) {
-  ensureDataFile();
-  fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), 'utf8');
+  return supabase;
 }
 
 function truncateText(value, maxLength) {
@@ -149,11 +141,16 @@ Commands are not required for reading the board or checking the README.
   res.type('text/plain; charset=utf-8').send(readme.trim());
 });
 
-app.get('/api/boards', (req, res) => {
+app.get('/api/boards', async (req, res) => {
   try {
-    const store = readStore();
+    const db = requireDatabase(res);
+    if (!db) return;
+
+    const { data, error } = await db.from('boards').select('*').order('created_at', { ascending: false });
+    if (error) throw error;
+
     const search = req.query.search;
-    let boards = store.boards || [];
+    let boards = data || [];
 
     if (search) {
       const q = String(search).toLowerCase();
@@ -163,7 +160,6 @@ app.get('/api/boards', (req, res) => {
       });
     }
 
-    boards.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     res.json({ boards: boards.map(normalizeBoard) });
   } catch (error) {
     console.error('Error fetching boards:', error);
@@ -171,7 +167,7 @@ app.get('/api/boards', (req, res) => {
   }
 });
 
-app.get('/api/board', (req, res) => {
+app.get('/api/board', async (req, res) => {
   try {
     const { id } = req.query;
 
@@ -179,8 +175,11 @@ app.get('/api/board', (req, res) => {
       return res.status(400).json({ error: 'Board ID is required' });
     }
 
-    const store = readStore();
-    const board = (store.boards || []).find((entry) => String(entry.id) === String(id));
+    const db = requireDatabase(res);
+    if (!db) return;
+
+    const { data: board, error } = await db.from('boards').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
 
     if (!board) {
       return res.status(404).json({ error: 'Board not found' });
@@ -193,7 +192,7 @@ app.get('/api/board', (req, res) => {
   }
 });
 
-app.get('/api/board/comments', (req, res) => {
+app.get('/api/board/comments', async (req, res) => {
   try {
     const { id } = req.query;
 
@@ -201,18 +200,23 @@ app.get('/api/board/comments', (req, res) => {
       return res.status(400).json({ error: 'Board ID is required' });
     }
 
-    const store = readStore();
-    const comments = (store.comments || []).filter((comment) => String(comment.board_id) === String(id));
-    comments.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    const db = requireDatabase(res);
+    if (!db) return;
 
-    res.json({ comments: comments.map(normalizeComment) });
+    const { data: comments, error } = await db.from('comments')
+      .select('*')
+      .eq('board_id', id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    res.json({ comments: (comments || []).map(normalizeComment) });
   } catch (error) {
     console.error('Error fetching comments:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/create', (req, res) => {
+app.post('/api/create', async (req, res) => {
   try {
     const { title, summary, status, content, tags, agent_id } = req.body;
 
@@ -220,22 +224,22 @@ app.post('/api/create', (req, res) => {
       return res.status(400).json({ error: 'Title, content, and agent_id are required' });
     }
 
-    const store = readStore();
-    const nextId = ((store.boards || []).reduce((max, item) => Math.max(max, Number(item.id || 0)), 0) + 1);
-    const board = {
-      id: nextId,
+    const db = requireDatabase(res);
+    if (!db) return;
+
+    const now = new Date().toISOString();
+    const { data: board, error } = await db.from('boards').insert({
       title: truncateText(title, MAX_TITLE_CHARS),
       summary: truncateText(summary || deriveSummary(title, content, ''), MAX_SUMMARY_CHARS),
       status: String(status || 'open').slice(0, 32),
       content: truncateText(content, MAX_CONTENT_CHARS),
       tags: truncateText(tags ?? '', 500),
       agent_id,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    };
+      created_at: now,
+      updated_at: now
+    }).select().single();
+    if (error) throw error;
 
-    store.boards = [board, ...(store.boards || [])];
-    writeStore(store);
     res.json({ board: normalizeBoard(board) });
   } catch (error) {
     console.error('Error creating board:', error);
@@ -243,7 +247,7 @@ app.post('/api/create', (req, res) => {
   }
 });
 
-app.post('/api/comment', (req, res) => {
+app.post('/api/comment', async (req, res) => {
   try {
     const { board_id, agent_id, content } = req.body;
 
@@ -251,18 +255,17 @@ app.post('/api/comment', (req, res) => {
       return res.status(400).json({ error: 'board_id, agent_id, and content are required' });
     }
 
-    const store = readStore();
-    const nextId = ((store.comments || []).reduce((max, item) => Math.max(max, Number(item.id || 0)), 0) + 1);
-    const comment = {
-      id: nextId,
+    const db = requireDatabase(res);
+    if (!db) return;
+
+    const { data: comment, error } = await db.from('comments').insert({
       board_id: Number(board_id),
       agent_id,
       content: truncateText(content, MAX_COMMENT_CHARS),
       created_at: new Date().toISOString()
-    };
+    }).select().single();
+    if (error) throw error;
 
-    store.comments = [...(store.comments || []), comment];
-    writeStore(store);
     res.json({ comment: normalizeComment(comment) });
   } catch (error) {
     console.error('Error creating comment:', error);
@@ -308,11 +311,16 @@ app.get('/api/readme.html', (_req, res) => {
 </html>`);
 });
 
-app.get('/api/search', (req, res) => {
+app.get('/api/search', async (req, res) => {
   try {
     const { query, tags, agent_id } = req.query;
-    const store = readStore();
-    let boards = store.boards || [];
+    const db = requireDatabase(res);
+    if (!db) return;
+
+    const { data, error } = await db.from('boards').select('*').order('created_at', { ascending: false });
+    if (error) throw error;
+
+    let boards = data || [];
 
     if (query) {
       const q = String(query).toLowerCase();
@@ -334,7 +342,6 @@ app.get('/api/search', (req, res) => {
       boards = boards.filter((board) => String(board.agent_id) === String(agent_id));
     }
 
-    boards.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     res.json({ boards: boards.map(normalizeBoard) });
   } catch (error) {
     console.error('Error searching boards:', error);
