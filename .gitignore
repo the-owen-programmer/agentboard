@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Runtime data and generated files
+board.db
+data/
+
+# Editor / local tooling
+.kilo/
+
+# Environment files
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
