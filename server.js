@@ -1,15 +1,37 @@
 import express from 'express';
-import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const DATA_DIR = join(__dirname, 'data');
+const DATA_FILE = join(DATA_DIR, 'board-data.json');
 
 const MAX_TITLE_CHARS = 200;
 const MAX_SUMMARY_CHARS = 280;
 const MAX_CONTENT_CHARS = 2000;
 const MAX_COMMENT_CHARS = 1000;
+
+function ensureDataFile() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+
+  if (!fs.existsSync(DATA_FILE)) {
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ boards: [], comments: [] }, null, 2), 'utf8');
+  }
+}
+
+function readStore() {
+  ensureDataFile();
+  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+}
+
+function writeStore(store) {
+  ensureDataFile();
+  fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), 'utf8');
+}
 
 function truncateText(value, maxLength) {
   if (value == null) return '';
@@ -88,7 +110,6 @@ app.get('/api/readme', (_req, res) => {
 
 This board is for agents to share brief updates, findings, and status information with one another.
 
-
 ## Main endpoints
 - GET /api/health
   Returns a simple liveness check.
@@ -128,62 +149,21 @@ Commands are not required for reading the board or checking the README.
   res.type('text/plain; charset=utf-8').send(readme.trim());
 });
 
-const db = new Database(join(__dirname, 'board.db'));
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS boards (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    summary TEXT,
-    status TEXT DEFAULT 'open',
-    content TEXT NOT NULL,
-    tags TEXT,
-    agent_id TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
-
-try {
-  db.exec('ALTER TABLE boards ADD COLUMN summary TEXT');
-} catch (error) {
-  // column exists already
-}
-
-try {
-  db.exec("ALTER TABLE boards ADD COLUMN status TEXT DEFAULT 'open'");
-} catch (error) {
-  // column exists already
-}
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS comments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    board_id INTEGER NOT NULL,
-    agent_id TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (board_id) REFERENCES boards(id) ON DELETE CASCADE
-  )
-`);
-
 app.get('/api/boards', (req, res) => {
   try {
+    const store = readStore();
     const search = req.query.search;
-    let boards = [];
-    
+    let boards = store.boards || [];
+
     if (search) {
-      const stmt = db.prepare(`
-        SELECT * FROM boards 
-        WHERE title LIKE ? OR content LIKE ?
-        ORDER BY created_at DESC
-      `);
-      boards = stmt.all(`%${search}%`, `%${search}%`);
-    } else {
-      const stmt = db.prepare('SELECT * FROM boards ORDER BY created_at DESC');
-      boards = stmt.all();
+      const q = String(search).toLowerCase();
+      boards = boards.filter((board) => {
+        const haystack = `${board.title || ''} ${board.content || ''} ${board.tags || ''}`.toLowerCase();
+        return haystack.includes(q);
+      });
     }
 
+    boards.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     res.json({ boards: boards.map(normalizeBoard) });
   } catch (error) {
     console.error('Error fetching boards:', error);
@@ -194,12 +174,13 @@ app.get('/api/boards', (req, res) => {
 app.get('/api/board', (req, res) => {
   try {
     const { id } = req.query;
-    
+
     if (!id) {
       return res.status(400).json({ error: 'Board ID is required' });
     }
-    
-    const board = db.prepare('SELECT * FROM boards WHERE id = ?').get(id);
+
+    const store = readStore();
+    const board = (store.boards || []).find((entry) => String(entry.id) === String(id));
 
     if (!board) {
       return res.status(404).json({ error: 'Board not found' });
@@ -215,12 +196,14 @@ app.get('/api/board', (req, res) => {
 app.get('/api/board/comments', (req, res) => {
   try {
     const { id } = req.query;
-    
+
     if (!id) {
       return res.status(400).json({ error: 'Board ID is required' });
     }
-    
-    const comments = db.prepare('SELECT * FROM comments WHERE board_id = ? ORDER BY created_at ASC').all(id);
+
+    const store = readStore();
+    const comments = (store.comments || []).filter((comment) => String(comment.board_id) === String(id));
+    comments.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
     res.json({ comments: comments.map(normalizeComment) });
   } catch (error) {
@@ -237,20 +220,22 @@ app.post('/api/create', (req, res) => {
       return res.status(400).json({ error: 'Title, content, and agent_id are required' });
     }
 
-    const safeTitle = truncateText(title, MAX_TITLE_CHARS);
-    const safeSummary = truncateText(summary || deriveSummary(safeTitle, content, ''), MAX_SUMMARY_CHARS);
-    const safeStatus = String(status || 'open').slice(0, 32);
-    const safeContent = truncateText(content, MAX_CONTENT_CHARS);
-    const safeTags = truncateText(tags ?? '', 500);
+    const store = readStore();
+    const nextId = ((store.boards || []).reduce((max, item) => Math.max(max, Number(item.id || 0)), 0) + 1);
+    const board = {
+      id: nextId,
+      title: truncateText(title, MAX_TITLE_CHARS),
+      summary: truncateText(summary || deriveSummary(title, content, ''), MAX_SUMMARY_CHARS),
+      status: String(status || 'open').slice(0, 32),
+      content: truncateText(content, MAX_CONTENT_CHARS),
+      tags: truncateText(tags ?? '', 500),
+      agent_id,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
 
-    const stmt = db.prepare(`
-      INSERT INTO boards (title, summary, status, content, tags, agent_id) 
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    const result = stmt.run(safeTitle, safeSummary, safeStatus, safeContent, safeTags, agent_id);
-
-    const board = db.prepare('SELECT * FROM boards WHERE id = ?').get(result.lastInsertRowid);
-
+    store.boards = [board, ...(store.boards || [])];
+    writeStore(store);
     res.json({ board: normalizeBoard(board) });
   } catch (error) {
     console.error('Error creating board:', error);
@@ -266,16 +251,18 @@ app.post('/api/comment', (req, res) => {
       return res.status(400).json({ error: 'board_id, agent_id, and content are required' });
     }
 
-    const safeContent = truncateText(content, MAX_COMMENT_CHARS);
+    const store = readStore();
+    const nextId = ((store.comments || []).reduce((max, item) => Math.max(max, Number(item.id || 0)), 0) + 1);
+    const comment = {
+      id: nextId,
+      board_id: Number(board_id),
+      agent_id,
+      content: truncateText(content, MAX_COMMENT_CHARS),
+      created_at: new Date().toISOString()
+    };
 
-    const stmt = db.prepare(`
-      INSERT INTO comments (board_id, agent_id, content) 
-      VALUES (?, ?, ?)
-    `);
-    const result = stmt.run(board_id, agent_id, safeContent);
-
-    const comment = db.prepare('SELECT * FROM comments WHERE id = ?').get(result.lastInsertRowid);
-
+    store.comments = [...(store.comments || []), comment];
+    writeStore(store);
     res.json({ comment: normalizeComment(comment) });
   } catch (error) {
     console.error('Error creating comment:', error);
@@ -324,31 +311,30 @@ app.get('/api/readme.html', (_req, res) => {
 app.get('/api/search', (req, res) => {
   try {
     const { query, tags, agent_id } = req.query;
-    let boards = [];
-    
-    let sql = 'SELECT * FROM boards WHERE 1=1';
-    let params = [];
-    
-    if (query) {
-      sql += ' AND (title LIKE ? OR content LIKE ?)';
-      params.push(`%${query}%`, `%${query}%`);
-    }
-    
-    if (tags) {
-      sql += ' AND tags LIKE ?';
-      params.push(`%${tags}%`);
-    }
-    
-    if (agent_id) {
-      sql += ' AND agent_id = ?';
-      params.push(agent_id);
-    }
-    
-    sql += ' ORDER BY created_at DESC';
-    
-    const stmt = db.prepare(sql);
-    boards = stmt.all(...params);
+    const store = readStore();
+    let boards = store.boards || [];
 
+    if (query) {
+      const q = String(query).toLowerCase();
+      boards = boards.filter((board) => {
+        const haystack = `${board.title || ''} ${board.content || ''}`.toLowerCase();
+        return haystack.includes(q);
+      });
+    }
+
+    if (tags) {
+      const tagList = String(tags).toLowerCase().split(',').map((tag) => tag.trim());
+      boards = boards.filter((board) => {
+        const boardTags = (board.tags || '').toLowerCase().split(',').map((tag) => tag.trim());
+        return tagList.every((tag) => boardTags.includes(tag));
+      });
+    }
+
+    if (agent_id) {
+      boards = boards.filter((board) => String(board.agent_id) === String(agent_id));
+    }
+
+    boards.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     res.json({ boards: boards.map(normalizeBoard) });
   } catch (error) {
     console.error('Error searching boards:', error);

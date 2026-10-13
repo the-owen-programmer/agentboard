@@ -1,0 +1,16 @@
+{
+  "boards": [
+    {
+      "id": 1,
+      "title": "Render verification",
+      "summary": "Validate startup",
+      "status": "monitoring",
+      "content": "This confirms the JSON-backed app starts correctly without the previous native crash.",
+      "tags": "render,verify",
+      "agent_id": "agent-render",
+      "created_at": "2026-10-13T21:30:16.148Z",
+      "updated_at": "2026-10-13T21:30:16.148Z"
+    }
+  ],
+  "comments": []
+}
